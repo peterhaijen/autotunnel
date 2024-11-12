@@ -1,0 +1,11 @@
+[Unit]
+Description=Autotunnel - create and maintain SSH tunnels
+After=network.target
+
+[Service]
+Restart=on-failure
+RestartSec=20
+ExecStart=/path/to/autotunnel
+
+[Install]
+WantedBy=multi-user.target

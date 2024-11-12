@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use v5.20;
+
+use AppConfig::Std;
+use Config::IniFiles;
+use POSIX qw(setuid setgid);
+use Sys::Syslog qw(:standard :macros);
+
+use vars qw ($VERSION);
+$VERSION = '1.0';
+
+#
+my $option = AppConfig::Std->new( { ERROR => sub { print STDERR "Ignoring invalid argument: " . shift . "\n" } } );
+$option->define("configfile|c=s", { DEFAULT => '/etc/autotunnel.conf' });
+
+# Process command line arguments
+$option->args() or die "Invalid arguments";
+
+# Debug mode enables verbose by default
+$option->verbose(1) if $option->debug;
+
+=pod
+
+=head1 NAME
+
+autotunnel - Start and maintain multiple SSH local and/or remote tunnels.
+
+=head1 SYNOPSIS
+
+autotunnel [OPTION]...
+
+=head1 OPTIONS AND ARGUMENTS
+
+  -c,--configfile     The main configuration file - defaults to /etc/autotunnel.conf
+
+     --debug          Debug output
+     --help           Print this info
+     --verbose        Verbose output
+     --version        Show version
+  
+=cut
+
+openlog("autotunnel","ndelay,nofatal" . ($option->verbose == 1 ? ",perror" : ""),"LOG_LOCAL0");
+syslog(LOG_INFO, "Starting");
+
+# Collect settings from config files
+syslog(LOG_ERR, "Could not read configuration file <" . $option->configfile . ">") and
+  die "Could not read configuration file <" . $option->configfile . ">" unless -r $option->configfile;
+syslog(LOG_INFO, "Reading configuration file <" . $option->configfile . ">") if $option->verbose;
+my $cfg = Config::IniFiles->new( -file => $option->configfile,
+                                 -default => "default",
+                                 -nomultiline => 0)
+    or syslog(LOG_ERR, "Syntax error in configuration file <" . $option->configfile . ">:\n" . join("\n", @Config::IniFiles::errors)) and die;
+
+foreach my $f ( map { glob $_ } $cfg->val('default','load') ) {
+
+  syslog(LOG_WARNING, "Skipping configuration file $f") and next unless -r $f;
+
+  syslog(LOG_INFO, "Reading configuration file $f") if $option->verbose;
+  my $newcfg = Config::IniFiles->new( -file => $f,
+                                      -default => "default",
+                                      -nomultiline => 0,
+                                      -import => $cfg)
+      or syslog(LOG_ERR, "Invalid configuration file <$f>:\n" . join("\n", @Config::IniFiles::errors)) and die;
+
+  $cfg = $newcfg;
+}
+
+my %child;
+#
+# Catch these signals, and forward to children
+#
+my $abort;
+
+sub handle_sig {
+  my $signal = shift;
+  syslog(LOG_INFO, "Received signal SIG${signal}") if $option->debug;
+  $abort++;
+  kill $signal, keys %child if $signal eq 'TERM';
+}
+
+$SIG{INT} = \&handle_sig;
+$SIG{TERM} = \&handle_sig;
+
+sub dossh {
+  my $section = shift;
+
+  my $user = $cfg->val($section,'runas');
+  if ( defined $user ) {
+    my $uid = getpwnam($user) or die "Unknown user: <$user>";
+    my $gid = getgrnam($user) or die "Unknown user: <$user>";
+    POSIX::setgid($gid) or die "setgid($gid): $!";
+    POSIX::setuid($uid) or die "setuid($uid): $!";
+    syslog(LOG_INFO, "[$section] Running as user <$user>") if $option->verbose;
+  }
+
+  my $host = $cfg->val($section,'host');
+  my @list = qw/ssh/;
+
+  my @options = $cfg->val($section,'option');
+  foreach my $o ( @options ) {
+    push @list, split ' ', $o;
+  }
+
+  my @local = $cfg->val($section,'local');
+  foreach my $l ( @local ) {
+    syslog(LOG_INFO, "[$section] Creating local forwarding: $l $host");
+    push @list, "-L", $l;
+  }
+
+  my @remote = $cfg->val($section,'remote');
+  foreach my $r ( @remote ) {
+    syslog(LOG_INFO, "[$section] Creating remote forwarding: $r $host");
+    push @list, "-R", $r;
+  }
+
+  push @list, $host;
+
+  syslog(LOG_DEBUG, "[$section] exec " . join(' ', @list)) if $option->debug;
+  exec '/usr/bin/env', @list;
+  die "exec failed: $!";
+}
+
+# Keep track when a process was last launched
+my %timestamp;
+
+sub launch {
+  my $section = shift;
+
+  # If the child process for this section is respawning too fast, we delay
+  # the next launch. Calculate the delay here.
+  my $delay = 0;
+  if ( defined $timestamp{$section} and 5 > time - $timestamp{$section} ) {
+    $delay = 5 - (time - $timestamp{$section});
+  }
+  
+  my $pid = fork();
+
+  if ( $pid ) {
+    # Parent, keep track of this child
+    $child{$pid} = $section;
+    # And keep track when the child was created
+    $timestamp{$section} = time + $delay;
+  } elsif ( 0 == $pid ) {
+    # Child, which establishes the SSH tunnel
+    if ( $delay ) {
+      syslog(LOG_INFO, "[$section] Respawning too fast, delay $delay seconds");
+      sleep $delay;
+    }
+    syslog(LOG_INFO, "[$section] Started process handler");
+    dossh($section);
+    die "Oops dossh should not return";
+  } else {
+    syslog(LOG_CRIT, "Could not fork: $!");
+    die "Could not fork: $!";
+  }
+}
+
+#
+# Create all tunnels
+#
+foreach my $section ( $cfg->Sections ) {
+
+  next if $section eq 'default';
+  next if $cfg->exists($section,'disabled');
+  launch($section);
+}
+
+# Display an error message if the configuration does not include
+# any tunnel
+syslog(LOG_ERR, "Nothing to do, aborting!") unless scalar keys %child;
+
+#
+# Loop until all children terminated
+#
+while ( scalar keys %child ) {
+    my $pid = waitpid -1, 0;
+    next unless $pid>0;
+    next unless defined $child{$pid};
+    my $rc = $?>>8;
+
+    my $section = $child{$pid};
+    delete $child{$pid};
+    syslog(LOG_INFO, "Process handler for [$section] has terminated with return code $rc");
+    launch($section) unless $abort;
+}
+
+syslog(LOG_INFO, "Finished");
